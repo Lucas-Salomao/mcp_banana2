@@ -8,4 +8,8 @@ dependencies = [
     "google-cloud-storage>=3.10.1",
     "google-genai>=1.69.0",
     "mcp>=1.26.0",
+    "pillow>=12.2.0",
+    "python-dotenv>=1.2.2",
+    "starlette>=0.46.0",
+    "uvicorn>=0.34.0",
 ]

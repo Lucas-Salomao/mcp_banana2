@@ -1,0 +1,1 @@
+npx @modelcontextprotocol/inspector .venv\Scripts\python.exe banana_mcp.py

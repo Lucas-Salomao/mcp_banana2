@@ -2,8 +2,7 @@
 Servidor MCP para geração e edição de imagens com Nano Banana 2 (Gemini 3.1 Flash Image)
 via Google AI Studio (Gemini API) com transporte SSE (HTTP) para deploy remoto (GKE).
 
-Versão ASGI Pura: Máxima estabilidade para conexões SSE e HTTP remotos.
-Inclui metadados completos e suporte a Resolução (1K, 2K, 4K).
+Versão ASGI Pura (Async): Máxima estabilidade para conexões SSE e Kubernetes.
 """
 
 import os
@@ -44,7 +43,7 @@ def get_client() -> genai.Client:
 def _resolve_model(model_name: str) -> str:
     return MODELS.get(model_name, model_name)
 
-def _load_image_resource(image_path: str) -> types.Part:
+async def _load_image_resource(image_path: str) -> types.Part:
     if image_path.startswith("gs://"):
         ext = Path(image_path).suffix.lower()
         mime_map = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".webp": "image/webp"}
@@ -54,12 +53,17 @@ def _load_image_resource(image_path: str) -> types.Part:
     if not path.exists(): raise FileNotFoundError(f"Imagem não encontrada: {image_path}")
     ext = path.suffix.lower()
     mime_map = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".webp": "image/webp"}
+    # Usar loop.run_in_executor para leitura de arquivo síncrona se necessário, mas aqui arquivos pequenos são ok
     with open(path, "rb") as f:
         return types.Part.from_bytes(data=f.read(), mime_type=mime_map.get(ext, "image/png"))
 
 def _save_response_images(response, output_path: str) -> list[str]:
     saved = []
     base = Path(output_path)
+    # Verifica se há partes na resposta
+    if not response.parts:
+        return []
+        
     image_count = 0
     for part in response.parts:
         if part.inline_data is not None:
@@ -73,20 +77,30 @@ def _save_response_images(response, output_path: str) -> list[str]:
             image_count += 1
     return saved
 
-def _upload_to_gcs(local_path: str, gcs_bucket_path: str) -> str:
+async def _upload_to_gcs_async(local_path: str, gcs_bucket_path: str) -> str:
     from google.cloud import storage
-    path_clean = gcs_bucket_path.removeprefix("gs://")
-    if "/" in path_clean:
-        bucket_name, blob_prefix = path_clean.split("/", 1)
-        blob_name = blob_prefix.rstrip("/") + "/" + Path(local_path).name if (blob_prefix.endswith("/") or "." not in Path(blob_prefix).name) else blob_prefix
-    else:
-        bucket_name = path_clean
-        blob_name = Path(local_path).name
-    gcs_client = storage.Client()
-    bucket = gcs_client.bucket(bucket_name)
-    blob = bucket.blob(blob_name)
-    blob.upload_from_filename(local_path)
-    return f"gs://{bucket_name}/{blob_name}"
+    def sync_upload():
+        path_clean = gcs_bucket_path.removeprefix("gs://")
+        if "/" in path_clean:
+            parts = path_clean.split("/", 1)
+            bucket_name = parts[0]
+            blob_prefix = parts[1]
+            # Se o prefixo termina com / ou não tem extensão, tratamos como pasta
+            if blob_prefix.endswith("/") or "." not in Path(blob_prefix).name:
+                blob_name = blob_prefix.rstrip("/") + "/" + Path(local_path).name
+            else:
+                blob_name = blob_prefix
+        else:
+            bucket_name = path_clean
+            blob_name = Path(local_path).name
+        
+        gcs_client = storage.Client()
+        bucket = gcs_client.bucket(bucket_name)
+        blob = bucket.blob(blob_name)
+        blob.upload_from_filename(local_path)
+        return f"gs://{bucket_name}/{blob_name}"
+    
+    return await asyncio.get_event_loop().run_in_executor(None, sync_upload)
 
 def _make_config() -> types.GenerateContentConfig:
     return types.GenerateContentConfig(response_modalities=["IMAGE", "TEXT"])
@@ -207,7 +221,8 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 search_types = [t for t, enabled in [("web_search", use_web_search), ("image_search", use_image_search)] if enabled]
                 config.tools = [types.Tool(google_search=types.GoogleSearch(search_types=search_types))]
 
-            response = client.models.generate_content(model=model_id, contents=[full_prompt], config=config)
+            # Usar cliente assíncrono para não travar o loop
+            response = await client.aio.models.generate_content(model=model_id, contents=[full_prompt], config=config)
 
         elif name == "edit_image":
             prompt = arguments["prompt"] + res_suffix
@@ -215,27 +230,34 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             output_path = arguments.get("output_path", "./edited_image.png")
             mask_path = arguments.get("mask_image_path")
 
-            contents = [prompt, _load_image_resource(input_path)]
-            if mask_path: contents.append(_load_image_resource(mask_path))
+            contents = [prompt, await _load_image_resource(input_path)]
+            if mask_path: contents.append(await _load_image_resource(mask_path))
 
-            response = client.models.generate_content(model=model_id, contents=contents, config=_make_config())
+            response = await client.aio.models.generate_content(model=model_id, contents=contents, config=_make_config())
 
         elif name == "multi_image_edit":
             prompt = arguments["prompt"] + res_suffix
             input_paths = arguments["input_image_paths"]
             output_path = arguments.get("output_path", "./combined_image.png")
 
-            contents = [prompt] + [_load_image_resource(p) for p in input_paths]
-            response = client.models.generate_content(model=model_id, contents=contents, config=_make_config())
+            parts = [await _load_image_resource(p) for p in input_paths]
+            response = await client.aio.models.generate_content(model=model_id, contents=[prompt] + parts, config=_make_config())
 
         elif name == "describe_and_edit":
             instruction = arguments["edit_instruction"] + res_suffix
             input_path = arguments["input_image_path"]
             output_path = arguments.get("output_path", "./result_image.png")
 
-            response = client.models.generate_content(model=model_id, contents=[instruction, _load_image_resource(input_path)], config=_make_config())
+            response = await client.aio.models.generate_content(model=model_id, contents=[instruction, await _load_image_resource(input_path)], config=_make_config())
         else:
             return [TextContent(type="text", text=f"❌ Ferramenta desconhecida: {name}")]
+
+        # Tratamento de Bloqueio de Segurança
+        if not response.parts:
+            reason = "Conteúdo bloqueado pelos filtros de segurança do Google (possível conteúdo impróprio ou violento)."
+            if response.candidates and response.candidates[0].finish_reason:
+                reason = f"Conteúdo bloqueado: {response.candidates[0].finish_reason}"
+            return [TextContent(type="text", text=f"⚠️ {reason}")]
 
         text_parts = [p.text for p in response.parts if p.text]
         description = "\n".join(text_parts) if text_parts else ""
@@ -243,7 +265,9 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
 
         gcs_uris = []
         if gcs_bucket_path and saved:
-            gcs_uris = [_upload_to_gcs(f, gcs_bucket_path) for f in saved]
+            for f in saved:
+                uri = await _upload_to_gcs_async(f, gcs_bucket_path)
+                gcs_uris.append(uri)
 
         result = f"✅ Sucesso!\n📁 Local: {', '.join(saved)}\n🎨 Modelo: {model_name}\n📏 Resolução: {resolution if model_name != 'nano-banana' else 'Standard (Lite)'}"
         if gcs_uris: result += f"\n☁️ GCS: {', '.join(gcs_uris)}"
@@ -263,9 +287,7 @@ sse = SseServerTransport("/messages")
 async def app(scope, receive, send):
     """Aplicação ASGI Pura compatível com Uvicorn e GKE."""
     
-    # 1. Tratamento de CORS manual (Simples e Direto)
     if scope["type"] == "http":
-        headers = dict(scope.get("headers", []))
         if scope["method"] == "OPTIONS":
             await send({
                 "type": "http.response.start", "status": 204,
@@ -278,32 +300,25 @@ async def app(scope, receive, send):
             await send({"type": "http.response.body", "body": b""})
             return
 
-    # 2. Roteamento de Rotas MCP
-    if scope["type"] == "http":
         path = scope["path"]
-        
-        # Conexão SSE Principal
         if path == "/sse":
             print("DEBUG: Iniciando conexão SSE...")
             async with sse.connect_sse(scope, receive, send) as (read_stream, write_stream):
                 await app_mcp.run(read_stream, write_stream, app_mcp.create_initialization_options())
             return
             
-        # Mensagens POST (JSON-RPC)
         elif path.startswith("/messages"):
-            print("DEBUG: Recebendo POST em /messages")
             await sse.handle_post_message(scope, receive, send)
             return
 
-    # 3. Fallback 404
     if scope["type"] == "http":
         await send({
             "type": "http.response.start", "status": 404,
             "headers": [(b"content-type", b"text/plain")]
         })
-        await send({"type": "http.response.body", "body": b"MCP Server Running. Use /sse to connect."})
+        await send({"type": "http.response.body", "body": b"MCP Server Running."})
 
 if __name__ == "__main__":
     import uvicorn
-    print(f"Banana MCP SSE (Pure ASGI) na porta {PORT}")
-    uvicorn.run(app, host="0.0.0.0", port=PORT)
+    print(f"Banana MCP SSE (Async) na porta {PORT}")
+    uvicorn.run(app, host="0.0.0.0", port=PORT, timeout_keep_alive=3600)
